@@ -60,7 +60,7 @@ def parse_card_files(f_fiserv, f_cabal, f_confiable, f_qr):
         df['Neto'] = pd.to_numeric(df['IMPORTE NETO'], errors='coerce')
         df['Descripción'] = "Fiserv - " + df['TARJETA'].astype(str)
         df['Origen'] = 'Fiserv'
-        cards_dfs.append(df[['Fecha_dt', 'Neto', 'Descripción', 'Origen']])
+        cards_dfs.append(df)
 
     if f_cabal:
         df = pd.read_excel(f_cabal).dropna(subset=['Fecha de pago']).copy()
@@ -68,7 +68,7 @@ def parse_card_files(f_fiserv, f_cabal, f_confiable, f_qr):
         df['Neto'] = pd.to_numeric(df['Importe neto final a liquidar'], errors='coerce')
         df['Descripción'] = "Liquidación Cabal"
         df['Origen'] = 'Cabal'
-        cards_dfs.append(df[['Fecha_dt', 'Neto', 'Descripción', 'Origen']])
+        cards_dfs.append(df)
 
     if f_confiable:
         df = pd.read_excel(f_confiable).dropna(subset=['Fecha de pago']).copy()
@@ -76,7 +76,7 @@ def parse_card_files(f_fiserv, f_cabal, f_confiable, f_qr):
         df['Neto'] = pd.to_numeric(df['Importe neto final a liquidar'], errors='coerce')
         df['Descripción'] = "Liquidación Confiable"
         df['Origen'] = 'Confiable'
-        cards_dfs.append(df[['Fecha_dt', 'Neto', 'Descripción', 'Origen']])
+        cards_dfs.append(df)
 
     if f_qr:
         df = pd.read_excel(f_qr).dropna(subset=['Fecha Operación']).copy()
@@ -84,7 +84,7 @@ def parse_card_files(f_fiserv, f_cabal, f_confiable, f_qr):
         df['Neto'] = pd.to_numeric(df['Monto acreditado'], errors='coerce')
         df['Descripción'] = "Liquidación QR - " + df['Transacción'].astype(str)
         df['Origen'] = 'QR'
-        cards_dfs.append(df[['Fecha_dt', 'Neto', 'Descripción', 'Origen']])
+        cards_dfs.append(df)
 
     if cards_dfs:
         return pd.concat(cards_dfs, ignore_index=True)
@@ -94,7 +94,7 @@ if file_mayor and file_banco:
     # 1. Parsear Banco
     df_b = parse_banco(file_banco)
     
-    # 2. Parsear Mayor
+    # 2. Parsear Mayor (conservando TODAS sus columnas originales)
     df_m = pd.read_excel(file_mayor, sheet_name=0)
     if 'Documento' in df_m.columns:
         df_m = df_m[df_m['Documento'] != 'Saldo Inicial'].copy()
@@ -102,20 +102,22 @@ if file_mayor and file_banco:
     has_card_files = any([file_fiserv, file_cabal, file_confiable, file_qr])
     
     if has_card_files:
-        # Filtrar asientos sumarios globales de tarjetas si se adjuntan las liquidaciones
         df_m = df_m[~df_m['Descripción'].astype(str).str.contains('Liquidación|LIQTAR', case=False, na=False)].copy()
         df_m = df_m[~df_m['Documento'].astype(str).str.contains('SR-LIQTAR', case=False, na=False)].copy()
 
-    df_m['Neto'] = df_m['Debe'].fillna(0) - df_m['Haber'].fillna(0)
-    df_m['Fecha_dt'] = pd.to_datetime(df_m['Fecha'])
+    # Agregar cálculo de Neto y Fecha_dt al Mayor manteniendo las demás columnas
+    debe_col = 'Debe' if 'Debe' in df_m.columns else df_m.columns[df_m.columns.str.lower() == 'debe'][0]
+    haber_col = 'Haber' if 'Haber' in df_m.columns else df_m.columns[df_m.columns.str.lower() == 'haber'][0]
+    
+    df_m['Neto'] = pd.to_numeric(df_m[debe_col], errors='coerce').fillna(0) - pd.to_numeric(df_m[haber_col], errors='coerce').fillna(0)
+    df_m['Fecha_dt'] = pd.to_datetime(df_m['Fecha'], errors='coerce')
     df_m['Origen'] = 'Mayor'
     
     # 3. Parsear Tarjetas
     df_cards = parse_card_files(file_fiserv, file_cabal, file_confiable, file_qr)
     
-    # Consolidar Registros Internos
-    cols = ['Fecha_dt', 'Neto', 'Descripción', 'Origen']
-    df_internal = pd.concat([df_m[cols], df_cards[cols]], ignore_index=True) if not df_cards.empty else df_m[cols]
+    # Consolidar Registros Internos para el loop de cruzamiento
+    df_internal = pd.concat([df_m, df_cards], ignore_index=True) if not df_cards.empty else df_m.copy()
     
     # Matching
     matched_banco = set()
@@ -144,11 +146,16 @@ if file_mayor and file_banco:
             matched_banco.add(best_idx)
             
             b_row = valid.loc[best_idx]
+            
+            desc_int = row_i.get('Descripción', '')
+            doc_int = row_i.get('Documento', '')
+            
             results.append({
                 'Estado': 'CONCILIADO',
                 'Origen': row_i['Origen'],
-                'Fecha_Interna': row_i['Fecha_dt'].strftime('%Y-%m-%d'),
-                'Descripción_Interna': row_i['Descripción'],
+                'Fecha_Interna': row_i['Fecha_dt'].strftime('%Y-%m-%d') if pd.notnull(row_i['Fecha_dt']) else '',
+                'Documento_Interno': doc_int,
+                'Descripción_Interna': desc_int,
                 'Monto_Interno': row_i['Neto'],
                 'Banco_Fecha': b_row['Fecha_dt'].strftime('%Y-%m-%d'),
                 'Banco_Descripción': b_row.get('Descripción', ''),
@@ -158,30 +165,46 @@ if file_mayor and file_banco:
             })
 
     df_conciliados = pd.DataFrame(results)
-    df_unmatched_internal = df_internal[~df_internal.index.isin(matched_internal)].copy()
+    
+    # Separar pendientes del Mayor manteniendo sus columnas originales integras
+    df_unmatched_mayor = df_m[~df_m.index.isin(matched_internal)].copy()
+    
+    # Separar pendientes de Tarjetas (si hubiera)
+    if not df_cards.empty:
+        df_unmatched_cards = df_internal[(df_internal['Origen'] != 'Mayor') & (~df_internal.index.isin(matched_internal))].copy()
+    else:
+        df_unmatched_cards = pd.DataFrame()
+        
     df_unmatched_banco = df_b[~df_b.index.isin(matched_banco)].copy()
     
     st.success("✅ ¡Conciliación procesada con éxito!")
     
     c1, c2, c3 = st.columns(3)
     c1.metric("Movimientos Conciliados", len(df_conciliados))
-    c2.metric("Pendientes Internos", len(df_unmatched_internal))
+    c2.metric("Pendientes en Mayor", len(df_unmatched_mayor))
     c3.metric("Pendientes en Banco", len(df_unmatched_banco))
     
-    tab1, tab2, tab3 = st.tabs(["🟢 Conciliados", "🔴 Pendientes Internos (Mayor/Tarjetas)", "🟡 Pendientes en Banco"])
+    tab1, tab2, tab3, tab4 = st.tabs(["🟢 Conciliados", "🔴 Pendientes en Mayor (Completo)", "🟡 Pendientes en Banco", "💳 Pendientes en Tarjetas"])
     
     with tab1:
         st.dataframe(df_conciliados, use_container_width=True)
     with tab2:
-        st.dataframe(df_unmatched_internal, use_container_width=True)
+        st.dataframe(df_unmatched_mayor, use_container_width=True)
     with tab3:
         st.dataframe(df_unmatched_banco[['Fecha', 'Concepto/Cod.Op.', 'Descripción', 'Importe_num']], use_container_width=True)
+    with tab4:
+        if not df_unmatched_cards.empty:
+            st.dataframe(df_unmatched_cards[['Fecha_dt', 'Origen', 'Descripción', 'Neto']], use_container_width=True)
+        else:
+            st.write("No hay tarjetas pendientes o no se subieron liquidaciones.")
         
-    output_filename = "Conciliacion_Consolidada_Resultado.xlsx"
+    output_filename = "Conciliacion_Resultado_Completo.xlsx"
     with pd.ExcelWriter(output_filename, engine='openpyxl') as writer:
         df_conciliados.to_excel(writer, sheet_name='Conciliados', index=False)
-        df_unmatched_internal.to_excel(writer, sheet_name='Pendientes_Internos', index=False)
+        df_unmatched_mayor.to_excel(writer, sheet_name='Pendientes_Mayor', index=False)
         df_unmatched_banco.to_excel(writer, sheet_name='Pendientes_Banco', index=False)
+        if not df_unmatched_cards.empty:
+            df_unmatched_cards.to_excel(writer, sheet_name='Pendientes_Tarjetas', index=False)
         
     with open(output_filename, "rb") as f:
         st.download_button(
